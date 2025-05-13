@@ -1,3 +1,10 @@
+/* Imports
+  ###########################################################################
+  ###########################################################################
+  ########################## LSP Server #####################################
+  ###########################################################################
+  ###########################################################################
+*/
 use futures_util::{SinkExt, StreamExt};
 use log::*;
 use serde::Deserialize;
@@ -15,20 +22,20 @@ struct LanguageServerConfig {
     command: String,
     args: Vec<String>,
 }
-
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum LanguageType {
     Rust,
     Go,
+    Python,
     JavaScript,
     TypeScript,
 }
-
 impl LanguageType {
     fn from_str(s: &str) -> Option<Self> {
         match s.to_lowercase().as_str() {
             "rust" => Some(LanguageType::Rust),
             "go" => Some(LanguageType::Go),
+            "python" => Some(LanguageType::Python),
             "javascript" | "js" => Some(LanguageType::JavaScript),
             "typescript" | "ts" => Some(LanguageType::TypeScript),
             _ => None,
@@ -53,13 +60,6 @@ struct LspMessage {
     params: Option<Value>,
 }
 
-/*
-  ###########################################################################
-  ###########################################################################
-  ######### Language server protocol connector using web-socket #############
-  ###########################################################################
-  ###########################################################################
-*/
 struct LspProcess {
     child: Child,
 }
@@ -70,7 +70,6 @@ impl LspProcess {
         if !config.args.is_empty() {
             command.args(&config.args);
         }
-
         let child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -80,10 +79,8 @@ impl LspProcess {
                 "Failed to start language server process: {}",
                 config.command
             ));
-
         LspProcess { child }
     }
-
     fn stdin(&mut self) -> &mut std::process::ChildStdin {
         self.child.stdin.as_mut().expect("Failed to get stdin")
     }
@@ -127,6 +124,13 @@ fn get_language_server_configs() -> HashMap<LanguageType, LanguageServerConfig> 
                 args: vec!["--stdio".to_string()],
             },
         );
+        configs.insert(
+            LanguageType::Python,
+            LanguageServerConfig {
+                command: "pyright-langserver.cmd".to_string(),
+                args: vec!["--stdio".to_string()],
+            },
+        );
     } else {
         // Linux/Mac configurations
         configs.insert(
@@ -157,6 +161,13 @@ fn get_language_server_configs() -> HashMap<LanguageType, LanguageServerConfig> 
                 args: vec!["--stdio".to_string()],
             },
         );
+        configs.insert(
+            LanguageType::Python,
+            LanguageServerConfig {
+                command: "pyright-langserver".to_string(),
+                args: vec!["--stdio".to_string()],
+            },
+        );
     }
 
     configs
@@ -173,23 +184,15 @@ async fn handle_websocket(stream: tokio::net::TcpStream) {
             return;
         }
     };
-
     let (mut ws_sender, mut ws_receiver) = ws_stream.split();
-
-    // Wait for initialization to determine which language server to start
     let mut language_type = None;
-
-    // Cache first message to send to LSP after it's started
     let mut first_message = None;
 
     while let Some(msg) = ws_receiver.next().await {
         match msg {
             Ok(Message::Text(text)) => {
                 debug!("Received initial message from client: {}", text);
-
-                // Try to parse as JSON to identify the language
                 if let Ok(message) = serde_json::from_str::<LspMessage>(&text) {
-                    // Check if this is an initialize request
                     if let Some(method) = &message.method {
                         if method == "initialize" {
                             if let Some(params) = &message.params {
@@ -204,15 +207,11 @@ async fn handle_websocket(stream: tokio::net::TcpStream) {
                                     }
                                 }
                             }
-
-                            // Cache this message to send to the language server
                             first_message = Some(text);
                             break;
                         }
                     }
                 }
-
-                // Default to Rust if we can't determine the language
                 if language_type.is_none() {
                     language_type = Some(LanguageType::Rust);
                     info!("Using default language: Rust");
@@ -252,8 +251,6 @@ async fn handle_websocket(stream: tokio::net::TcpStream) {
     );
 
     let lsp_process = Arc::new(Mutex::new(LspProcess::new(config)));
-
-    // Handle LSP stderr output
     let mut stderr = lsp_process.lock().await.child.stderr.take().unwrap();
     tokio::spawn(async move {
         let mut stderr_buf = [0u8; 1024];
@@ -271,96 +268,67 @@ async fn handle_websocket(stream: tokio::net::TcpStream) {
             }
         }
     });
-
     let lsp_process_clone = lsp_process.clone();
-
-    // If we have a cached first message, send it now
     if let Some(message) = first_message {
         let mut lsp = lsp_process.lock().await;
         let content = message;
         let header = format!("Content-Length: {}\r\n\r\n", content.len());
-
         let stdin = lsp.stdin();
         let _ = stdin.write_all(header.as_bytes());
         let _ = stdin.write_all(content.as_bytes());
         let _ = stdin.flush();
     }
-
-    // Handle messages from WebSocket (client) to LSP
     let client_to_lsp = async move {
         while let Some(msg) = ws_receiver.next().await {
             match msg {
                 Ok(Message::Text(text)) => {
                     debug!("Received from client: {}", text);
-
-                    // Acquire and release the lock in a separate block
                     {
                         let mut lsp = lsp_process.lock().await;
-
                         let content = text;
                         let header = format!("Content-Length: {}\r\n\r\n", content.len());
-
                         let stdin = lsp.stdin();
                         let _ = stdin.write_all(header.as_bytes());
                         let _ = stdin.write_all(content.as_bytes());
                         let _ = stdin.flush();
-                    } // MutexGuard is dropped here
+                    }
                 }
                 Ok(Message::Binary(data)) => {
                     debug!("Received binary data from client: {} bytes", data.len());
-
-                    // Acquire and release the lock in a separate block
                     {
                         let mut lsp = lsp_process.lock().await;
-
-                        // Forward binary data to LSP process
                         if let Err(e) = lsp.stdin().write_all(&data) {
                             error!("Failed to write binary data to LSP process: {}", e);
                             break;
                         }
-                    } // MutexGuard is dropped here
+                    }
                 }
                 Ok(Message::Close(_)) => {
-                    info!("Client closed connection");
+                    info!("CL closed connection");
                     break;
                 }
-                Ok(_) => {} // Ignore other message types
+                Ok(_) => {}
                 Err(e) => {
                     error!("Error receiving WebSocket message: {:?}", e);
                     break;
                 }
             }
         }
-
-        info!("Client to LSP task ended");
+        info!("CL -> LSP task ended");
     };
-
     use std::io::{BufRead, BufReader};
-
     let lsp_to_client = async move {
-        // Take ownership of stdout
         let stdout = {
             let mut lsp = lsp_process_clone.lock().await;
             lsp.child.stdout.take().expect("Failed to get stdout")
-        }; // Lock is released here
-
-        debug!("LSP to client is working");
-
-        // Use a standard library BufReader since ChildStdout doesn't implement AsyncRead
+        };
         let mut reader = BufReader::new(stdout);
-
-        // Create a channel for communication between the sync reading thread and the async task
         let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(100);
-
-        // Spawn a thread to read from the process stdout (blocking I/O)
         std::thread::spawn(move || {
             let mut line = String::new();
             let mut buffer = Vec::new();
-
             loop {
-                // Read headers to find Content-Length
                 let mut content_length: Option<usize> = None;
-
                 loop {
                     line.clear();
                     match reader.read_line(&mut line) {
@@ -370,7 +338,6 @@ async fn handle_websocket(stream: tokio::net::TcpStream) {
                             if trimmed.is_empty() {
                                 break; // Empty line indicates end of headers
                             }
-
                             if trimmed.to_lowercase().starts_with("content-length:") {
                                 if let Some(len_str) = trimmed.split(':').nth(1) {
                                     content_length = len_str.trim().parse::<usize>().ok();
@@ -383,8 +350,6 @@ async fn handle_websocket(stream: tokio::net::TcpStream) {
                         }
                     }
                 }
-
-                // Read message body
                 if let Some(len) = content_length {
                     buffer.clear();
                     buffer.resize(len, 0);
@@ -392,9 +357,8 @@ async fn handle_websocket(stream: tokio::net::TcpStream) {
                     match reader.read_exact(&mut buffer) {
                         Ok(_) => {
                             if let Ok(message) = String::from_utf8(buffer.clone()) {
-                                // Send the message to the async task
                                 if tx.blocking_send(message).is_err() {
-                                    break; // Channel closed, receiver dropped
+                                    break;
                                 }
                             } else {
                                 error!("Failed to decode LSP message as UTF-8");
@@ -411,28 +375,26 @@ async fn handle_websocket(stream: tokio::net::TcpStream) {
                 }
             }
         });
-
-        // Process messages from the sync reading thread
         while let Some(message) = rx.recv().await {
-            debug!("LSP -> client: {}", message);
-
+            debug!("LSP -> CL: {}", message);
             if let Err(e) = ws_sender.send(Message::Text(message.into())).await {
-                error!("Failed to send to WebSocket client: {:?}", e);
+                error!("WS FAIL client: {:?}", e);
                 break;
             }
         }
-
-        info!("LSP to client task ended");
+        info!("LSP -> CLIENT. PROCESS FINISHED");
         let _ = ws_sender.close().await;
     };
-
-    // Run both tasks concurrently
     tokio::select! {
         _ = client_to_lsp => {
-            info!("Client to LSP task finished");
+            info!("=================================================");
+            info!("CL -> LSP task finished");
+            info!("=================================================");
         },
         _ = lsp_to_client => {
-            info!("LSP to client task finished");
+            info!("=================================================");
+            info!("LSP -> CL task finished");
+            info!("=================================================");
         },
     }
 }
@@ -442,20 +404,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::Builder::from_default_env()
         .filter(None, log::LevelFilter::Debug)
         .init();
-
-    info!("Starting Multi-Language LSP WebSocket server on 127.0.0.1:9002");
-    info!("Supported languages: Rust, Go, JavaScript, TypeScript");
-
-    let listener = TokioTcpListener::bind("127.0.0.1:9002").await?;
-
+    info!("=================================================");
+    let listener = TokioTcpListener::bind("127.0.0.1:9003").await?;
     while let Ok((stream, addr)) = listener.accept().await {
-        info!("New connection from {}", addr);
-
-        // Spawn a new task for each connection
+        info!("CONN: {}", addr);
         tokio::spawn(async move {
             handle_websocket(stream).await;
         });
     }
-
+    info!("=================================================");
     Ok(())
 }
